@@ -5,7 +5,7 @@ from time import sleep
 
 def parse_woman_forum():
     base_url = "https://www.woman.ru/forum/"
-    sort_param = "?sort=1d"
+    sort_param = "?sort=7d"
     page = 1
     unique_links = set()
     
@@ -62,12 +62,17 @@ def parse_topic_pages(links):
             comment_element = soup.find(class_="card__comment")
             comment = comment_element.get_text(strip=True) if comment_element else None
             
+            # Извлекаем первый элемент времени на странице
+            time_element = soup.find('time')
+            date = time_element['datetime'] if time_element and time_element.has_attr('datetime') else None
+            
             # Добавляем результат только если есть хотя бы заголовок или комментарий
             if title or comment:
                 results.append({
                     'link': link,
                     'title': title,
-                    'comment': comment
+                    'comment': comment,
+                    'date': date  # Добавляем дату в результат
                 })
             
             # Пауза между запросами
@@ -94,3 +99,4 @@ if __name__ == "__main__":
         print(f"Ссылка: {item['link']}")
         print(f"Заголовок: {item['title']}")
         print(f"Комментарий: {item['comment'][:100] + '...' if item['comment'] else 'Нет комментария'}")
+        print(f"Дата: {item['date']}")

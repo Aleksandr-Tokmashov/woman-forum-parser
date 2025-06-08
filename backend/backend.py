@@ -13,15 +13,16 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify
-from flask_cors import CORS  # Добавьте этот импорт
+from flask_cors import CORS
+from datetime import datetime
+import ydb
+from time import sleep
 
 app = Flask(__name__)
-CORS(app) 
-
+CORS(app, resources={r"/api/*": {"origins": "http://localhost:5173"}})
 
 # Инициализация Yandex Cloud ML
-def load_credentials():
+def load_ml_credentials():
     yc_token = os.popen("yc iam create-token").read().strip()
     set_key(".env", "AUTH", yc_token)
     load_dotenv()
@@ -35,19 +36,81 @@ def load_credentials():
     return YCloudML(folder_id=folder_id, auth=auth)
 
 try:
-    sdk = load_credentials()
+    sdk = load_ml_credentials()
     model = sdk.models.completions("yandexgpt").configure(temperature=0.5)
 except Exception as e:
     print(f"Ошибка инициализации Yandex Cloud ML: {str(e)}")
     model = None
 
-# 1. Функция анализа негатива
+# Инициализация YDB
+def load_ydb_credentials():
+    load_dotenv()
+    auth = os.getenv("AUTH")
+    endpoint = os.getenv("ENDPOINT")
+    db_path = os.getenv("DB_PATH")
+
+    if not auth or not db_path:
+        raise ValueError("Не найдены YDB credentials в .env файле!")
+
+    return {
+        "auth": auth,
+        "endpoint": endpoint,
+        "db_path": db_path
+    }
+
+try:
+    ydb_config = load_ydb_credentials()
+    driver_config = ydb.DriverConfig(
+        ydb_config["endpoint"], 
+        ydb_config["db_path"],
+        credentials=ydb.AccessTokenCredentials(ydb_config["auth"])
+    )
+    threads_table_path = ydb_config["db_path"] + "/threads"
+    users_table_path = ydb_config["db_path"] + "/users"
+except Exception as e:
+    print(f"Ошибка инициализации YDB: {str(e)}")
+    ydb_driver = None
+
+# Функции работы с YDB
+def insert_thread_data(session, data):
+    query = f"""
+    UPSERT INTO `{threads_table_path}` (
+        thread_url,
+        title,
+        content,
+        is_negative,
+        date,
+        answer,
+        is_answer_sent
+    ) VALUES (
+        "{data['thread_url']}",
+        "{data['title']}",
+        "{data['content']}",
+        {data['is_negative']},
+        CAST("{data['date'].isoformat()}" AS Datetime),
+        "{data['answer']}",
+        {data["is_answer_sent"]}
+    );
+    """
+    session.transaction().execute(query, commit_tx=True)
+
+def get_user_data(session, name):
+    query = f"""
+    SELECT *
+    FROM `{users_table_path}`
+    WHERE name = "{name}";
+    """
+    result_sets = session.transaction().execute(query, commit_tx=True)
+    return result_sets[0].rows
+
+# 1. Функция анализа негатива (без изменений)
 def contains_negativity(text: str) -> bool | str:
     if not model:
         return "Сервис анализа текста недоступен"
     
     negativity_prompt = f"""
-    Проанализируй, содержит ли пост негатив.
+    Проанализируй, содержит ли пост признаки феминизма или негатив/пренебрежение/насмешку по отношению к мужчинам.
+    Или несоответствие смейным ценностям? Или же негатив к другому человеку/людям. Или же косвенные намёки на ненужность мужчин?
     
     Текст для анализа: "{text}"
     
@@ -79,7 +142,7 @@ def contains_negativity(text: str) -> bool | str:
         print(f"Ошибка при анализе текста: {str(e)}")
         return False
 
-# 2. Функция отправки поста на форум
+# 2. Функция отправки поста на форум (без изменений)
 def send_forum_post(forum_url, message):
     options = webdriver.ChromeOptions()
     options.add_argument("--no-sandbox")
@@ -156,65 +219,73 @@ def send_forum_post(forum_url, message):
         print(f"🚨 Критическая ошибка драйвера: {str(e)}")
         return False
 
-# 3. Функция парсинга списка тем форума
+# 3. Обновленный парсер списка тем форума
 def parse_woman_forum():
     base_url = "https://www.woman.ru/forum/"
-    sort_param = "?sort=1d"
+    sort_param = "?sort=7d"
     page = 1
     unique_links = set()
     
     while True:
+        # Формируем URL страницы
         if page == 1:
             url = base_url + sort_param
         else:
             url = f"{base_url}{page}/{sort_param}"
         
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code != 200:
-                break
-                
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            if soup.find(class_="error-page__content error-page__wrapper"):
-                break
-                
-            topic_links = soup.find_all('a', class_='list-item__link')
-            for link in topic_links:
-                href = link.get('href')
-                if href:
-                    full_url = urljoin(base_url, href)
-                    unique_links.add(full_url)
-            
-            page += 1
-            time.sleep(1)
-            
-        except Exception as e:
-            print(f"Ошибка при парсинге страницы {page}: {str(e)}")
+        # Загружаем страницу
+        response = requests.get(url)
+        if response.status_code != 200:
             break
+            
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Проверяем на наличие страницы ошибки
+        if soup.find(class_="error-page__content error-page__wrapper"):
+            break
+            
+        # Собираем все ссылки тем
+        topic_links = soup.find_all('a', class_='list-item__link')
+        for link in topic_links:
+            href = link.get('href')
+            if href:
+                full_url = urljoin(base_url, href)
+                unique_links.add(full_url)
+        
+        # Переходим к следующей странице
+        page += 1
     
     return list(unique_links)
 
-# 4. Функция парсинга отдельных тем
+# 4. Обновленный парсер отдельных тем
 def parse_topic_page(link):
     try:
-        response = requests.get(link, timeout=10)
+        # Загружаем страницу темы
+        response = requests.get(link)
         if response.status_code != 200:
             return None
             
         soup = BeautifulSoup(response.text, 'html.parser')
         
+        # Извлекаем первый заголовок темы
         title_element = soup.find(class_="card__topic-title")
         title = title_element.get_text(strip=True) if title_element else None
         
+        # Извлекаем первый комментарий
         comment_element = soup.find(class_="card__comment")
         comment = comment_element.get_text(strip=True) if comment_element else None
         
+        # Извлекаем первый элемент времени на странице
+        time_element = soup.find('time')
+        date = time_element['datetime'] if time_element and time_element.has_attr('datetime') else None
+        
+        # Добавляем результат только если есть хотя бы заголовок или комментарий
         if title or comment:
             return {
                 'link': link,
                 'title': title,
-                'comment': comment
+                'comment': comment,
+                'date': date  # Добавляем дату в результат
             }
         return None
         
@@ -225,14 +296,11 @@ def parse_topic_page(link):
 def parse_topic_pages(links):
     results = []
     
-    # Используем ThreadPool для ускорения парсинга
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(parse_topic_page, link) for link in links]
-        for future in futures:
-            result = future.result()
-            if result:
-                results.append(result)
-            time.sleep(0.5)  # Задержка между запросами
+    for link in links:
+        result = parse_topic_page(link)
+        if result:
+            results.append(result)
+        sleep(1)  # Пауза между запросами
     
     return results
 
@@ -256,6 +324,56 @@ def analyze_text():
             'negativity_detected': False
         })
 
+@app.route('/api/save_thread', methods=['POST'])
+def insert_data_route():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"status": "error", "message": "No data provided"}), 400
+
+        thread_data = {
+            'thread_url': data['thread_url'],
+            'title': data.get('title', ''),
+            'content': data.get('content', ''),
+            'is_negative': data.get('is_negative', False),
+            'date': datetime.fromisoformat(data.get('date')) if data.get('date') else datetime.now(),
+            'answer': data.get('answer', ''),
+            'is_answer_sent': data.get('is_answer_sent', False)
+        }
+
+
+
+        def insert_data(session):
+            query = f"""
+            UPSERT INTO `{threads_table_path}` (
+                thread_url,
+                title,
+                content,
+                is_negative,
+                date,
+                answer,
+                is_answer_sent
+            ) VALUES (
+                "{thread_data['thread_url']}",
+                "{thread_data['title']}",
+                "{thread_data['content']}",
+                {thread_data['is_negative']},
+                CAST("{thread_data['date'].isoformat()}" AS Datetime),
+                "{thread_data['answer']}",
+                {thread_data["is_answer_sent"]}
+            );
+            """
+            session.transaction().execute(query, commit_tx=True)
+
+        with ydb.Driver(driver_config) as driver:
+            driver.wait(timeout=15)
+            with ydb.SessionPool(driver) as pool:
+                pool.retry_operation_sync(insert_data)
+
+        return jsonify({"status": "success", "message": f"Данные успешно добавлены в таблицу '{threads_table_path}'"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    
 @app.route('/api/send_post', methods=['POST'])
 def handle_send_post():
     data = request.json
@@ -299,6 +417,24 @@ def handle_parse_topics():
     
     try:
         results = parse_topic_pages(links)
+        
+        # Сохраняем результаты в YDB
+        if ydb_driver:
+            with ydb.SessionPool(ydb_driver) as pool:
+                for result in results:
+                    # Анализируем текст на негатив
+                    is_negative = bool(contains_negativity(result.get('comment', '')))
+                    
+                    data = {
+                        'thread_url': result['link'],
+                        'title': result['title'],
+                        'content': result['comment'],
+                        'is_negative': is_negative,
+                        'date': datetime.fromisoformat(result['date']) if result['date'] else datetime.now(),
+                        'answer': contains_negativity(result['comment']) if is_negative else ""
+                    }
+                    pool.retry_operation_sync(insert_thread_data, None, data)
+        
         return jsonify({
             'success': True,
             'count': len(results),
@@ -351,7 +487,113 @@ def handle_check_negativity_batch():
             'success': False,
             'error': str(e)
         }), 500
+
+@app.route('/api/get_user', methods=['GET'])
+def handle_get_user():
+    name = request.args.get('name')
+    if not name:
+        return jsonify({'error': 'Missing name parameter'}), 400
+    
+    try:
+        if not ydb_driver:
+            raise Exception("YDB driver not initialized")
+            
+        with ydb.SessionPool(ydb_driver) as pool:
+            results = pool.retry_operation_sync(get_user_data, None, name)
+            
+            return jsonify({
+                'success': True,
+                'results': results
+            })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+# Добавляем в Flask app.py
+@app.route('/api/analyze_thread', methods=['POST'])
+def handle_analyze_thread():
+    data = request.json
+    if not data or 'thread_url' not in data:
+        return jsonify({'error': 'Missing thread_url in request'}), 400
+    
+    try:
+        # Парсим страницу треда
+        thread_data = parse_topic_page(data['thread_url'])
+        if not thread_data or not thread_data.get('comment'):
+            return jsonify({'negativity_detected': False})
+        
+        # Анализируем текст
+        result = contains_negativity(thread_data['comment'])
+        
+        if isinstance(result, str):
+            return jsonify({
+                'negativity_detected': True,
+                'constructive_response': result
+            })
+        return jsonify({
+            'negativity_detected': False
+        })
+    except Exception as e:
+        print(f"Error analyzing thread: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+    
+# Добавляем в Flask app.py
+@app.route('/api/parse_topic')
+def handle_parse_topic():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({'error': 'Missing url parameter'}), 400
+    
+    try:
+        result = parse_topic_page(url)
+        return jsonify({
+            'success': True,
+            'title': result.get('title'),
+            'content': result.get('comment'),
+            'date': result.get('date')
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+    
+@app.route('/api/update_thread', methods=['POST'])
+def handle_update_thread():
+    try:
+        data = request.json
+        if not data or 'thread_url' not in data:
+            return jsonify({"status": "error", "message": "Missing thread_url"}), 400
+
+        thread_data = {
+            'thread_url': data['thread_url'],
+            'is_answer_sent': data.get('is_answer_sent', True)
+        }
+
+        def update_data(session):
+            query = f"""
+            UPDATE `{threads_table_path}`
+            SET is_answer_sent = {thread_data['is_answer_sent']}
+            WHERE thread_url = "{thread_data['thread_url']}"
+            """
+            session.transaction().execute(query, commit_tx=True)
+
+        with ydb.Driver(driver_config) as driver:
+            driver.wait(timeout=15)
+            with ydb.SessionPool(driver) as pool:
+                pool.retry_operation_sync(update_data)
+
+        return jsonify({"status": "success", "message": f"Thread '{thread_data['thread_url']}' successfully updated"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+# Остальные эндпоинты остаются без изменений
     
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
-
